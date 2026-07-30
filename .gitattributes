@@ -1,0 +1,7 @@
+# Authored on Windows, consumed by a Linux runner. LayoutTests compare the runner's LF output
+# against -expected.txt byte for byte, so a CRLF checkout would fail every test for a reason that
+# has nothing to do with the finding. Force LF on everything.
+* text eol=lf
+*.html text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
