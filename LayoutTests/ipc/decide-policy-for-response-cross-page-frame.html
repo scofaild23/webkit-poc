@@ -70,6 +70,12 @@ function writeUint64LE(u8, off, val) {
 let captured = null;
 let capturedDestID = null;
 
+// Every outgoing message name seen while the iframe navigates. Only printed when capture FAILS.
+// Without this, a miss looks identical to a pass that did nothing: the test just says
+// "not-captured" and we learn neither whether the message fires nor what it is really called.
+// A failing run should hand back the information needed to fix it, not just a verdict.
+const seenNames = new Set();
+
 async function main() {
     if (!window.IPC)
         return done();
@@ -98,8 +104,17 @@ async function main() {
     await new Promise(r => setTimeout(r, 100));
     const iframeFrameID = BigInt(ifr.contentWindow.IPC.frameID[0]);
 
-    const msgName = IPC.messages.WebPageProxy_DecidePolicyForResponse.name;
+    const msgDesc = IPC.messages.WebPageProxy_DecidePolicyForResponse;
+    if (!msgDesc) {
+        // The message is declared in WebPageProxy.messages.in, so its absence here would mean the
+        // IPC testing API is not exposing it under this name — worth knowing immediately rather
+        // than debugging as a capture timeout.
+        console.log("DIAG: IPC.messages.WebPageProxy_DecidePolicyForResponse is undefined");
+        return done();
+    }
+    const msgName = msgDesc.name;
     IPC.addOutgoingMessageListener("UI", (m) => {
+        seenNames.add(m.name);
         if (m.name === msgName && !captured) {
             captured = m.buffer.slice(0);
             capturedDestID = m.destinationID;
@@ -109,10 +124,14 @@ async function main() {
     // A response policy decision is only taken for a load that actually produces a response, so
     // navigate to a real resource rather than about:blank or a data: URL.
     ifr.src = "resources/cross-page-target.html?r=" + Date.now();
-    for (let i = 0; i < 100 && !captured; i++)
+    for (let i = 0; i < 150 && !captured; i++)
         await new Promise(r => setTimeout(r, 20));
-    if (!captured)
+    if (!captured) {
+        // Hand back what would be needed to fix this, instead of a bare verdict.
+        console.log("DIAG: expected message name: " + msgName);
+        console.log("DIAG: outgoing messages observed: " + [...seenNames].sort().join(", "));
         return done();
+    }
 
     // frameInfo is the first argument of DecidePolicyForResponse, so its frameID appears early in
     // the body -- unlike DecidePolicyForNavigationActionAsync, where the upstream test patches the
