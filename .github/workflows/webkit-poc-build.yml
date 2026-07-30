@@ -153,6 +153,7 @@ jobs:
           # on a bare runner and have nothing to do with IPC or navigation policy.
           Tools/Scripts/build-webkit --gtk --release --makeargs="-j3" \
             --cmakeargs="-DDEVELOPER_MODE=ON -DENABLE_IPC_TESTING_API=ON \
+                         -DENABLE_BUBBLEWRAP_SANDBOX=OFF \
                          -DENABLE_EXPERIMENTAL_FEATURES=OFF \
                          -DENABLE_THUNDER=OFF -DUSE_THUNDER=OFF -DUSE_LIBBACKTRACE=OFF" \
             2>&1 | tee /mnt/build.log
