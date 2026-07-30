@@ -72,9 +72,38 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          cd "$SRC" && sudo Tools/gtk/install-dependencies
-          sudo apt-get install -y ccache ninja-build xvfb
-          ccache --version
+          cd "$SRC"
+
+          # Run #1 died here with exit 100 — apt's code for "package not found / broken deps".
+          # Two entries in Tools/gtk/dependencies/apt are stale on Ubuntu 24.04:
+          #   libtiff5-dev   -> renamed libtiff-dev after 22.04
+          #   x11proto-*-dev -> folded into x11proto-dev; several no longer exist
+          # WebKit already has a helper for exactly this situation and uses it further down the
+          # same file, so wrap the risky names in aptIfExists rather than deleting them — that
+          # keeps the packages if a given release still has them.
+          sed -i -E 's/^(\s*)(x11proto-(gl|input|randr|scrnsaver|video|xf86dri)-dev)$/\1$(aptIfExists \2)/' \
+            Tools/gtk/dependencies/apt
+          sed -i -E 's/^(\s*)libtiff5-dev$/\1$(aptIfExists libtiff5-dev)\n\1$(aptIfExists libtiff-dev)/' \
+            Tools/gtk/dependencies/apt
+          echo "===== patched entries ====="
+          grep -nE "libtiff|x11proto" Tools/gtk/dependencies/apt
+
+          # Non-fatal on purpose: one missing optional package should not cost a whole run before
+          # we even learn which package it was. The build step is the real gate.
+          set +e
+          sudo Tools/gtk/install-dependencies 2>&1 | tee /mnt/deps.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "install-dependencies exit = $rc"
+          if [ "$rc" -ne 0 ]; then
+            ERR=$(grep -aEi -m 30 'E:|Unable to locate|no installation candidate|not available|Depends:' \
+                    /mnt/deps.log | cut -c1-300 | sed 's/%/%25/g; s/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=install-dependencies exit $rc::${ERR:-no apt error lines matched}"
+          fi
+
+          sudo apt-get install -y ccache ninja-build xvfb || true
+          ccache --version || true
+          exit 0
 
       - name: Install the PoC test into the tree
         run: |
@@ -183,6 +212,7 @@ jobs:
         with:
           name: webkit-poc-logs
           path: |
+            /mnt/deps.log
             /mnt/build.log
             /mnt/control.log
             /mnt/attack.log
