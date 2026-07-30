@@ -1,0 +1,194 @@
+# Build WebKit GTK with the IPC Testing API and run the decidePolicyForResponse PoC.
+#
+# Everything structural here is carried over from the Firefox PoC workflow, which was debugged to
+# the point of actually compiling on a hosted runner:
+#   * 24 G swap on /mnt        - the linker and heavy TUs get killed without it (that was exit 143)
+#   * source and build on /mnt - / has ~21 GiB free, a WebKit build outgrows it
+#   * ccache saved even when the build FAILS - so a rerun resumes instead of starting cold
+#   * the first error lines are surfaced, and echoed into a ::error:: annotation, because GitHub
+#     requires a signed-in session to read step logs but annotations are public
+#
+# The control does not need to be written: WebKit ships
+# LayoutTests/ipc/decide-policy-for-navigation-action-cross-page-frame.html, added by the very
+# commit (e9f94fd4c6) that patched the sibling handlers. Running Apple's own test as the control
+# and ours as the attack is the strongest possible framing.
+
+name: WebKit decidePolicyForResponse PoC
+
+on:
+  workflow_dispatch:
+
+env:
+  SRC: /mnt/wk
+  CCACHE_DIR: /mnt/ccache
+  CCACHE_MAXSIZE: 12G
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Check out this repo (the PoC test lives here)
+        uses: actions/checkout@v5
+        with:
+          path: poc
+
+      - name: Prepare the runner — disk, swap, workspace
+        run: |
+          echo "=== before ==="; free -h; df -h / /mnt
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 24G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          sudo sysctl vm.swappiness=10
+          sudo mkdir -p "$SRC" "$CCACHE_DIR"
+          sudo chown -R "$(id -un)" /mnt
+          echo "=== after ==="; free -h; df -h / /mnt; swapon --show
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: /mnt/ccache
+          key: ccache-wkgtk-v1-${{ github.run_id }}
+          restore-keys: ccache-wkgtk-v1-
+
+      - name: Clone WebKit (shallow)
+        run: |
+          git clone --depth 1 https://github.com/WebKit/WebKit.git "$SRC"
+          git -C "$SRC" log -1 --format='%H %ad' --date=short
+          # The finding is the ABSENCE of an ownership check here. Record what the tree actually
+          # says at build time, so the artifact proves which revision was tested.
+          echo "===== decidePolicyForResponse as built ====="
+          sed -n '/^void WebPageProxy::decidePolicyForResponse(/,/^}/p' \
+            "$SRC/Source/WebKit/UIProcess/WebPageProxy.cpp" | head -20
+          echo "===== ownership checks present in this file: ====="
+          grep -c "page() == this" "$SRC/Source/WebKit/UIProcess/WebPageProxy.cpp" || true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          cd "$SRC" && sudo Tools/gtk/install-dependencies
+          sudo apt-get install -y ccache ninja-build xvfb
+          ccache --version
+
+      - name: Install the PoC test into the tree
+        run: |
+          cp "$GITHUB_WORKSPACE"/poc/LayoutTests/ipc/decide-policy-for-response-cross-page-frame*.* \
+             "$SRC/LayoutTests/ipc/"
+          ls -la "$SRC/LayoutTests/ipc/" | grep decide-policy
+          # The control and its fixture must already exist — if they do not, this WebKit revision
+          # predates e9f94fd4c6 and the whole comparison is void.
+          test -f "$SRC/LayoutTests/ipc/decide-policy-for-navigation-action-cross-page-frame.html" \
+            && echo "CONTROL present" \
+            || echo "::error::Control test missing — this tree predates commit e9f94fd4c6."
+          test -f "$SRC/LayoutTests/ipc/resources/cross-page-target.html" \
+            && echo "fixture present" || echo "::error::resources/cross-page-target.html missing."
+
+      - name: Build WebKit GTK
+        id: build
+        continue-on-error: true      # a dead build must still save its ccache
+        timeout-minutes: 280
+        run: |
+          ( while true; do
+              echo "[mon $(date -u +%H:%M:%S)] $(free -m | awk '/Mem:/{printf "mem_used=%sM avail=%sM",$3,$7}') \
+          $(free -m | awk '/Swap:/{printf " swap_used=%sM",$3}') \
+          $(df -m /mnt | awk 'NR==2{printf " mnt_free=%sM",$4}')"
+              sleep 60
+            done ) &
+          MON=$!
+          cd "$SRC"
+          set +e
+          # DEVELOPER_MODE is what keeps ENABLE_IPC_TESTING_API on; it is requested explicitly
+          # rather than relied upon. The disabled options are optional deps that are simply absent
+          # on a bare runner and have nothing to do with IPC or navigation policy.
+          Tools/Scripts/build-webkit --gtk --release --makeargs="-j3" \
+            --cmakeargs="-DDEVELOPER_MODE=ON -DENABLE_IPC_TESTING_API=ON \
+                         -DENABLE_EXPERIMENTAL_FEATURES=OFF \
+                         -DENABLE_THUNDER=OFF -DUSE_THUNDER=OFF -DUSE_LIBBACKTRACE=OFF" \
+            2>&1 | tee /mnt/build.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          kill $MON 2>/dev/null || true
+          echo "===== first 40 error lines ====="
+          grep -naEi -m 40 '(^| )(error|fatal|cannot|undefined reference|no such file)' \
+            /mnt/build.log || echo "(no lines matched)"
+          echo "===== last 80 lines ====="
+          tail -80 /mnt/build.log
+          echo "build-webkit exit code = $rc"
+          if [ "$rc" -ne 0 ]; then
+            ERR=$(grep -aEi -m 25 '(^| )(error|fatal|cannot|undefined reference|no such file)' \
+                    /mnt/build.log | cut -c1-300 | sed 's/%/%25/g; s/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=build-webkit failed (exit $rc)::${ERR:-no error lines matched}"
+          fi
+          ccache -s || true
+          exit $rc
+
+      - name: Save ccache            # runs even when the build died, so reruns resume
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /mnt/ccache
+          key: ccache-wkgtk-v1-${{ github.run_id }}
+
+      - name: Did we get a build?
+        id: check
+        run: |
+          BIN=$(find "$SRC/WebKitBuild" -maxdepth 4 -type f -name "MiniBrowser" -o \
+                     -maxdepth 4 -type f -name "WebKitWebProcess" 2>/dev/null | head -1)
+          echo "search result: ${BIN:-<none>}"
+          if [ -n "$BIN" ]; then
+            echo "built=yes" >> "$GITHUB_OUTPUT"; ls -lh "$BIN"
+          else
+            echo "built=no" >> "$GITHUB_OUTPUT"
+            echo "::error::No WebKit binaries under $SRC/WebKitBuild — see the [mon ...] lines."
+            find "$SRC/WebKitBuild" -maxdepth 3 -type d 2>/dev/null | head -20
+          fi
+
+      - name: CONTROL — Apple's own test through a PATCHED handler
+        if: steps.check.outputs.built == 'yes'
+        continue-on-error: true
+        run: |
+          cd "$SRC"
+          # Expected: rejected by MESSAGE_CHECK, i.e. the WebContent process is terminated.
+          Tools/Scripts/run-webkit-tests --gtk --release --display-server=xvfb \
+            --no-retry-failures --verbose \
+            ipc/decide-policy-for-navigation-action-cross-page-frame.html 2>&1 | tee /mnt/control.log
+          echo "===== CONTROL verdict ====="
+          grep -iE "crash|pass|fail|timed out" /mnt/control.log | tail -20 || true
+
+      - name: ATTACK — the same forgery through the UNPATCHED handler
+        if: steps.check.outputs.built == 'yes'
+        continue-on-error: true
+        run: |
+          cd "$SRC"
+          # Expected on a vulnerable tree: accepted, no termination, the test prints its text.
+          Tools/Scripts/run-webkit-tests --gtk --release --display-server=xvfb \
+            --no-retry-failures --verbose \
+            ipc/decide-policy-for-response-cross-page-frame.html 2>&1 | tee /mnt/attack.log
+          echo "===== ATTACK verdict ====="
+          grep -iE "crash|pass|fail|timed out" /mnt/attack.log | tail -20 || true
+          echo
+          echo "===== THE COMPARISON IS THE FINDING ====="
+          echo "control (patched handler): $(grep -ciE 'crash' /mnt/control.log || echo 0) crash lines"
+          echo "attack  (unpatched)      : $(grep -ciE 'crash' /mnt/attack.log  || echo 0) crash lines"
+
+      - name: Upload logs and results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webkit-poc-logs
+          path: |
+            /mnt/build.log
+            /mnt/control.log
+            /mnt/attack.log
+            /mnt/wk/WebKitBuild/Release/layout-test-results/**
+          if-no-files-found: warn
+
+      - name: Fail the run if the build never finished
+        if: steps.check.outputs.built != 'yes'
+        run: exit 1

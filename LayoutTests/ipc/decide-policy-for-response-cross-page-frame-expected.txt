@@ -1,0 +1,2 @@
+DecidePolicyForResponse cross-page frame replay: accepted-not-terminated
+A WebContent process that sends DecidePolicyForResponse naming a different WebPageProxy's WebFrameProxy must be rejected by MESSAGE_CHECK before the foreign frame is touched.

