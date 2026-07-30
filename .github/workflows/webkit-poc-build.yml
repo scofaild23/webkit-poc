@@ -74,7 +74,23 @@ jobs:
           sudo apt-get update
           cd "$SRC"
 
-          # Run #1 died here with exit 100 — apt's code for "package not found / broken deps".
+          # THE ACTUAL CAUSE of exit 100 in runs #1 and #2, per the annotation:
+          #
+          #   git-svn : Depends: git (< 1:2.43.0-.) but 1:2.54.0-0ppa1~ubuntu24.04.1 is to be installed
+          #   E: Unable to correct problems, you have held broken packages.
+          #
+          # The runner ships git 2.54 from a PPA; Ubuntu 24.04's git-svn pins git < 2.43. The
+          # conflict is unsatisfiable, so apt refuses the WHOLE transaction and nothing gets
+          # installed — which is also why the build then died in FindGLib.cmake.
+          # git-svn sits under the comment "dependencies necessary for using webkit-patch", i.e.
+          # the patch-submission workflow, and has nothing to do with building. Drop just that one
+          # line; subversion beside it is left alone since it is not what apt objected to.
+          sed -i -E '/^\s*git-svn\s*$/d' Tools/glib/dependencies/apt
+          echo "===== git-svn removed (expect 0): $(grep -c 'git-svn' Tools/glib/dependencies/apt) ====="
+
+          # The two edits below were a GUESS made before the annotation existed, and they were NOT
+          # the cause. They are kept because they are correct anyway — libtiff5-dev genuinely does
+          # not exist on 24.04 — but they fixed nothing on their own.
           # Two entries in Tools/gtk/dependencies/apt are stale on Ubuntu 24.04:
           #   libtiff5-dev   -> renamed libtiff-dev after 22.04
           #   x11proto-*-dev -> folded into x11proto-dev; several no longer exist
@@ -167,8 +183,13 @@ jobs:
       - name: Did we get a build?
         id: check
         run: |
-          BIN=$(find "$SRC/WebKitBuild" -maxdepth 4 -type f -name "MiniBrowser" -o \
-                     -maxdepth 4 -type f -name "WebKitWebProcess" 2>/dev/null | head -1)
+          # Latent bug, caught by reading rather than by burning a run: `-name A -o -name B` with
+          # -maxdepth repeated mid-expression does not mean what it looks like — -maxdepth is a
+          # global option and the -o splits the tests, so the second branch loses -type f. Group the
+          # alternation properly. Depth 6 because WebKitGTK lands binaries at
+          # WebKitBuild/GTK/Release/bin/.
+          BIN=$(find "$SRC/WebKitBuild" -maxdepth 6 -type f \
+                  \( -name MiniBrowser -o -name WebKitWebProcess \) 2>/dev/null | head -1)
           echo "search result: ${BIN:-<none>}"
           if [ -n "$BIN" ]; then
             echo "built=yes" >> "$GITHUB_OUTPUT"; ls -lh "$BIN"
