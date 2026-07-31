@@ -217,16 +217,28 @@ jobs:
         continue-on-error: true
         run: |
           cd "$SRC"
-          # Expected on a vulnerable tree: accepted, no termination, the test prints its text.
           Tools/Scripts/run-webkit-tests --gtk --release --display-server=xvfb \
-            --no-retry-failures --verbose \
+            --no-retry-failures --no-show-results --verbose \
             ipc/decide-policy-for-response-cross-page-frame.html 2>&1 | tee /mnt/attack.log
           echo "===== ATTACK verdict ====="
           grep -iE "crash|pass|fail|timed out" /mnt/attack.log | tail -20 || true
-          echo
-          echo "===== THE COMPARISON IS THE FINDING ====="
-          echo "control (patched handler): $(grep -ciE 'crash' /mnt/control.log || echo 0) crash lines"
-          echo "attack  (unpatched)      : $(grep -ciE 'crash' /mnt/attack.log  || echo 0) crash lines"
+
+          # Run #4 reported "failed unexpectedly (text diff)" and that was ALL we learned, because
+          # the results directory was uploaded from the wrong path. What the test actually printed
+          # is the entire result, so read it here rather than depending on the artifact at all.
+          RES=$(find /mnt/wk/WebKitBuild -maxdepth 4 -type d -name layout-test-results | head -1)
+          echo "===== results dir: ${RES:-<none>} ====="
+          ACT=$(find "$RES" -name "*decide-policy-for-response*-actual.txt" 2>/dev/null | head -1)
+          DIF=$(find "$RES" -name "*decide-policy-for-response*-diff.txt" 2>/dev/null | head -1)
+          echo "===== ACTUAL OUTPUT ====="
+          cat "$ACT" 2>/dev/null || echo "(no -actual.txt found)"
+          echo "===== DIFF ====="
+          cat "$DIF" 2>/dev/null || echo "(no -diff.txt found)"
+
+          # Step logs need a signed-in session; annotations do not. Send the actual output out
+          # through one so the result is readable from the run page alone.
+          OUT=$(cat "$ACT" 2>/dev/null | cut -c1-300 | sed 's/%/%25/g; s/\r//g' | awk '{printf "%s%%0A", $0}')
+          echo "::error title=ATTACK actual output::${OUT:-no -actual.txt produced}"
 
       - name: Upload logs and results
         if: always()
@@ -238,7 +250,7 @@ jobs:
             /mnt/build.log
             /mnt/control.log
             /mnt/attack.log
-            /mnt/wk/WebKitBuild/Release/layout-test-results/**
+            /mnt/wk/WebKitBuild/GTK/Release/layout-test-results/**
           if-no-files-found: warn
 
       - name: Fail the run if the build never finished
