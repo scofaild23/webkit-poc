@@ -234,23 +234,52 @@ jobs:
         continue-on-error: true
         run: |
           cd "$SRC"
-          # Expected: rejected by MESSAGE_CHECK, i.e. the WebContent process is terminated.
-          Tools/Scripts/run-webkit-tests --gtk --release --display-server=xvfb \
-            --no-retry-failures --verbose \
+          # Runs #4-#6: both tests passed with byte-identical stderr, so there was no signal at all.
+          # Source/WebKit/Platform/IPC/Connection.h explains why:
+          #
+          #   #if ENABLE(IPC_TESTING_API)
+          #   #define CRASH_IF_TESTING            // empty
+          #   #else
+          #   #define CRASH_IF_TESTING if (shouldCrashOnMessageCheckFailure()) { CRASH(); }
+          #   #endif
+          #
+          # A MESSAGE_CHECK failure CANNOT crash the process in a build that has the IPC testing
+          # API — and that API is precisely what lets the test send the forged message. "Control
+          # crashes, attack survives" was impossible by construction.
+          #
+          # What the macro DOES emit is
+          #   RELEASE_LOG_FAULT_WITH_PAYLOAD(IPC, "… Invalid message dispatched %s …")
+          # from the UI process. The per-test -stderr.txt captures the WEB process, which is why
+          # both files were identical. Capture the runner's own output and grep for that string:
+          # it appears for the patched handler and must not appear for the unpatched one.
+          WEBKIT_DEBUG=IPC Tools/Scripts/run-webkit-tests --gtk --release --display-server=xvfb \
+            --no-retry-failures --no-show-results --verbose \
             ipc/decide-policy-for-navigation-action-cross-page-frame.html 2>&1 | tee /mnt/control.log
           echo "===== CONTROL verdict ====="
-          grep -iE "crash|pass|fail|timed out" /mnt/control.log | tail -20 || true
+          grep -iE "crash|pass|fail|timed out" /mnt/control.log | tail -10 || true
+          echo "===== CONTROL: Invalid message dispatched ====="
+          grep -aiE "Invalid message dispatched|Message check failed" /mnt/control.log || echo "(none)"
 
       - name: ATTACK — the same forgery through the UNPATCHED handler
         if: steps.check.outputs.built == 'yes'
         continue-on-error: true
         run: |
           cd "$SRC"
-          Tools/Scripts/run-webkit-tests --gtk --release --display-server=xvfb \
+          WEBKIT_DEBUG=IPC Tools/Scripts/run-webkit-tests --gtk --release --display-server=xvfb \
             --no-retry-failures --no-show-results --verbose \
             ipc/decide-policy-for-response-cross-page-frame.html 2>&1 | tee /mnt/attack.log
           echo "===== ATTACK verdict ====="
-          grep -iE "crash|pass|fail|timed out" /mnt/attack.log | tail -20 || true
+          grep -iE "crash|pass|fail|timed out" /mnt/attack.log | tail -10 || true
+
+          # THE FINDING IS THIS COMPARISON.
+          C=$(grep -aciE "Invalid message dispatched|Message check failed" /mnt/control.log || echo 0)
+          A=$(grep -aciE "Invalid message dispatched|Message check failed" /mnt/attack.log  || echo 0)
+          echo "===== DIFFERENTIAL ====="
+          echo "control (PATCHED  decidePolicyForNavigationActionAsync): $C message-check rejections"
+          echo "attack  (UNPATCHED decidePolicyForResponse)            : $A message-check rejections"
+          echo "===== ATTACK: Invalid message dispatched ====="
+          grep -aiE "Invalid message dispatched|Message check failed" /mnt/attack.log || echo "(none)"
+          echo "::error title=DIFFERENTIAL control=$C attack=$A::control>0 and attack=0 is the finding. Both 0 means neither replay reached a check — the test, not the target, is at fault."
 
           # Run #4 reported "failed unexpectedly (text diff)" and that was ALL we learned, because
           # the results directory was uploaded from the wrong path. What the test actually printed
