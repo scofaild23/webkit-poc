@@ -148,11 +148,21 @@ jobs:
           MON=$!
           cd "$SRC"
           set +e
-          # DEVELOPER_MODE is what keeps ENABLE_IPC_TESTING_API on; it is requested explicitly
-          # rather than relied upon. The disabled options are optional deps that are simply absent
-          # on a bare runner and have nothing to do with IPC or navigation policy.
+          # Run #5 built for three hours and then reported `no-ipc`, because -DENABLE_IPC_TESTING_API
+          # is NOT a CMake option — CMake listed it under "Manually-specified variables were not used
+          # by the project" and carried on. The real gate, from Source/WTF/wtf/PlatformEnable.h:
+          #
+          #   #if … || (ASSERT_ENABLED && (PLATFORM(GTK) || PLATFORM(WPE)) && COMPILER(GCC))
+          #   #define ENABLE_IPC_TESTING_API 1
+          #
+          # and ASSERT_ENABLED itself is `#ifndef ASSERT_ENABLED / #ifdef NDEBUG → 0`. --release
+          # defines NDEBUG, so the API was off by construction. The #ifndef guard means defining it
+          # on the command line is the supported override, which keeps the optimised build instead
+          # of paying for a full --debug one. WebKit's own comment says GTK+GCC+assertions is what
+          # their EWS tests, so this is a supported configuration rather than a hack.
           Tools/Scripts/build-webkit --gtk --release --makeargs="-j3" \
-            --cmakeargs="-DDEVELOPER_MODE=ON -DENABLE_IPC_TESTING_API=ON \
+            --cmakeargs="-DDEVELOPER_MODE=ON \
+                         -DCMAKE_CXX_FLAGS=-DASSERT_ENABLED=1 \
                          -DENABLE_BUBBLEWRAP_SANDBOX=OFF \
                          -DENABLE_EXPERIMENTAL_FEATURES=OFF \
                          -DENABLE_THUNDER=OFF -DUSE_THUNDER=OFF -DUSE_LIBBACKTRACE=OFF" \
@@ -160,6 +170,16 @@ jobs:
           rc=${PIPESTATUS[0]}
           set -e
           kill $MON 2>/dev/null || true
+
+          # THE CHECK THAT WOULD HAVE SAVED RUN #5's THREE HOURS.
+          # CMake only *warns* when a -D flag matches no option, then builds anyway. That warning
+          # is the difference between a build that can prove something and one that cannot, so
+          # treat it as fatal for the flags we actually depend on.
+          if grep -aq "Manually-specified variables were not used by the project" /mnt/build.log; then
+            IGN=$(sed -n '/Manually-specified variables were not used/,/^$/p' /mnt/build.log | tr -d ' ')
+            echo "===== CMake ignored these -D flags ====="; echo "$IGN"
+            echo "::error title=CMake ignored a requested flag::${IGN}"
+          fi
           echo "===== first 40 error lines ====="
           grep -naEi -m 40 '(^| )(error|fatal|cannot|undefined reference|no such file)' \
             /mnt/build.log || echo "(no lines matched)"
@@ -194,6 +214,15 @@ jobs:
           echo "search result: ${BIN:-<none>}"
           if [ -n "$BIN" ]; then
             echo "built=yes" >> "$GITHUB_OUTPUT"; ls -lh "$BIN"
+            # A binary is not enough — run #5 produced one and still could not test anything.
+            # If ENABLE_IPC_TESTING_API compiled in, the IPC testing class names are in the
+            # WebProcess binary. Check before spending the test steps on a build that cannot work.
+            WP=$(find "$SRC/WebKitBuild" -maxdepth 6 -type f -name "WebKitWebProcess" | head -1)
+            N=$(strings "$WP" 2>/dev/null | grep -c "IPCTestingAPI\|IPCStreamTester" || true)
+            echo "IPC testing symbols in WebProcess: $N"
+            if [ "${N:-0}" -eq 0 ]; then
+              echo "::error title=IPC Testing API is NOT in this build::window.IPC will be undefined and both tests will pass or fail vacuously. Check ASSERT_ENABLED reached the compiler."
+            fi
           else
             echo "built=no" >> "$GITHUB_OUTPUT"
             echo "::error::No WebKit binaries under $SRC/WebKitBuild — see the [mon ...] lines."
